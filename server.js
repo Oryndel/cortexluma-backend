@@ -29,15 +29,16 @@ app.post("/api/chat", async (req, res) => {
     const { message } = req.body;
     if (!message) return res.status(400).json({ error: "message is required" });
 
-    // 🔴 FIX: Changed deprecated 'gemini-pro' to the recommended 'gemini-2.5-flash'
+    // FIX: Changed model from 'gemini-pro' (deprecated/invalid) to 'gemini-2.5-flash'
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
     const body = {
+      // Minimal request shape — you can expand with more fields later
       contents: [{ parts: [{ text: message }] }],
-      // ADDITION for Speed: Limit the output length to force a concise response.
-      generationConfig: {
-        maxOutputTokens: 200, 
-      },
+      // Optional: Add generation config here if needed (e.g., temperature)
+      // generationConfig: {
+      //   temperature: 0.9, 
+      // },
     };
 
     const response = await fetch(url, {
@@ -48,23 +49,25 @@ app.post("/api/chat", async (req, res) => {
 
     if (!response.ok) {
       const text = await response.text();
+      // Log the original API error for debugging
       console.error("Gemini API returned non-200:", response.status, text);
       return res
-        .status(502) // Bad Gateway from upstream API
+        .status(502) // Send a 502 to the frontend (Bad Gateway from upstream API)
         .json({ error: "Upstream API error", status: response.status, details: text });
     }
 
     const data = await response.json();
+    // Safely extract the reply text
     const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
     return res.json({ reply, raw: data });
   } catch (err) {
     console.error("Server error:", err);
-    return res.status(500).json({ error: "Server error", details: err.message });
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ Server listening on port ${PORT}`);
+  console.log(`Server is running on port ${PORT}`);
 });
