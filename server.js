@@ -29,14 +29,14 @@ app.post("/api/chat", async (req, res) => {
     const { message } = req.body;
     if (!message) return res.status(400).json({ error: "message is required" });
 
-    // FIX: Ensure the correct model ID is used for the non-streaming endpoint.
+    // 🔴 FIX: Changed deprecated 'gemini-pro' to the recommended 'gemini-2.5-flash'
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
     const body = {
       contents: [{ parts: [{ text: message }] }],
       // ADDITION for Speed: Limit the output length to force a concise response.
       generationConfig: {
-        maxOutputTokens: 200, // This is a good balance for quick chat replies.
+        maxOutputTokens: 200, 
       },
     };
 
@@ -48,26 +48,23 @@ app.post("/api/chat", async (req, res) => {
 
     if (!response.ok) {
       const text = await response.text();
-      // Log the original API error for debugging
       console.error("Gemini API returned non-200:", response.status, text);
       return res
-        .status(502) 
-        // Returning the status code and details back to the client
+        .status(502) // Bad Gateway from upstream API
         .json({ error: "Upstream API error", status: response.status, details: text });
     }
 
     const data = await response.json();
-    // Safely extract the reply text
     const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
     return res.json({ reply, raw: data });
   } catch (err) {
     console.error("Server error:", err);
-    return res.status(500).json({ error: "Internal server error" });
+    return res.status(500).json({ error: "Server error", details: err.message });
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+  console.log(`✅ Server listening on port ${PORT}`);
 });
