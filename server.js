@@ -15,8 +15,7 @@ app.use(express.json({ limit: '50mb' }));
 
 // -----------------------------------------------------------------
 // STREAMING CHAT ENDPOINT (Analysis: gemini-2.5-flash with Google Search)
-// Now includes configurable parameters for creativity, output control,
-// system personality, safety, and multi-image support.
+// Handles multi-turn chat, multi-image analysis, and configurable settings.
 // -----------------------------------------------------------------
 app.post('/api/stream-chat', async (req, res) => {
     // Set headers for streaming (Server-Sent Events configuration for plain text chunks)
@@ -27,10 +26,10 @@ app.post('/api/stream-chat', async (req, res) => {
         'Transfer-Encoding': 'chunked'
     });
 
-    // FEATURE 1, 2, 3, 5: Destructure new config parameters and multiple images
+    // Destructure new config parameters and multiple images
     const { 
         history, 
-        imageParts, // FEATURE 5: Array of image parts
+        imageParts, 
         temperature, 
         maxOutputTokens, 
         systemInstruction 
@@ -43,7 +42,7 @@ app.post('/api/stream-chat', async (req, res) => {
 
     let contents = history; 
     
-    // FEATURE 5: Handle MULTIPLE image parts (up to 4 supported by frontend)
+    // Handle MULTIPLE image parts (up to 4 supported by frontend)
     if (imageParts && imageParts.length > 0) {
         const lastUserMessage = contents.pop(); 
         const multiModalMessage = {
@@ -58,8 +57,7 @@ app.post('/api/stream-chat', async (req, res) => {
         contents.push(multiModalMessage);
     }
     
-    // FEATURE 4: Define Safety Settings (Moderate Blocking)
-    // This is set to BLOCK_MEDIUM_AND_ABOVE by default for better user experience.
+    // Define Safety Settings (Moderate Blocking)
     const safetySettings = [
       { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
       { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
@@ -72,19 +70,19 @@ app.post('/api/stream-chat', async (req, res) => {
             model: "gemini-2.5-flash", 
             contents: contents, 
             config: {
-                // Existing feature: Google Search grounding
+                // FEATURE: Google Search grounding
                 tools: [{ googleSearch: {} }], 
                 
-                // FEATURE 1: Temperature (Creativity)
+                // FEATURE: Temperature (Creativity)
                 temperature: temperature !== undefined ? parseFloat(temperature) : 0.7, 
                 
-                // FEATURE 3: Max Output Tokens
+                // FEATURE: Max Output Tokens
                 maxOutputTokens: maxOutputTokens !== undefined ? parseInt(maxOutputTokens) : 2048,
                 
-                // FEATURE 2: System Instruction/Personality
+                // FEATURE: System Instruction/Personality
                 systemInstruction: systemInstruction || "You are CortexLuma, a powerful, witty, and highly helpful AI assistant built by Google. You excel at real-time data retrieval and coding tasks. Keep your answers concise, clear, and engaging.",
                 
-                // FEATURE 4: Safety Settings
+                // FEATURE: Safety Settings
                 safetySettings: safetySettings
             }
         });
@@ -98,7 +96,7 @@ app.post('/api/stream-chat', async (req, res) => {
     } catch (error) {
         console.error("Gemini API Error:", error);
         // Send a clearer error back to the client
-        res.write(`Error: An internal API error occurred. Details: ${error.message}`);
+        res.write(`Error: An internal API error occurred. Please check the backend's GEMINI_API_KEY and logs. Details: ${error.message}`);
     } finally {
         res.end(); 
     }
