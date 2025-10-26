@@ -14,8 +14,9 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 // -----------------------------------------------------------------
-// STREAMING CHAT ENDPOINT (Analysis: gemini-2.5-flash)
-// Handles multi-turn text chat and multi-modal image analysis.
+// STREAMING CHAT ENDPOINT (Analysis: gemini-2.5-flash with Google Search)
+// Handles multi-turn text chat, multi-modal image analysis, and uses
+// Google Search for real-time information.
 // -----------------------------------------------------------------
 app.post('/api/stream-chat', async (req, res) => {
     // Set headers for streaming (Server-Sent Events configuration for plain text chunks)
@@ -52,6 +53,10 @@ app.post('/api/stream-chat', async (req, res) => {
         const stream = await ai.models.generateContentStream({
             model: "gemini-2.5-flash", 
             contents: contents, 
+            config: {
+                // FEATURE ADDED: Enable Google Search for up-to-date grounding
+                tools: [{ googleSearch: {} }], 
+            }
         });
 
         for await (const chunk of stream) {
@@ -67,8 +72,6 @@ app.post('/api/stream-chat', async (req, res) => {
         res.end(); 
     }
 });
-
-// NOTE: The /api/generate-image endpoint has been completely removed.
 
 app.listen(port, () => {
     console.log(`Server listening on port ${port}`);
