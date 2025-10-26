@@ -15,8 +15,8 @@ app.use(express.json({ limit: '50mb' }));
 
 // -----------------------------------------------------------------
 // STREAMING CHAT ENDPOINT (Analysis: gemini-2.5-flash with Google Search)
-// Handles multi-turn text chat, multi-modal image analysis, and uses
-// Google Search for real-time information.
+// Now includes configurable parameters for creativity, output control,
+// system personality, safety, and multi-image support.
 // -----------------------------------------------------------------
 app.post('/api/stream-chat', async (req, res) => {
     // Set headers for streaming (Server-Sent Events configuration for plain text chunks)
@@ -27,7 +27,14 @@ app.post('/api/stream-chat', async (req, res) => {
         'Transfer-Encoding': 'chunked'
     });
 
-    const { history, imagePart } = req.body;
+    // FEATURE 1, 2, 3, 5: Destructure new config parameters and multiple images
+    const { 
+        history, 
+        imageParts, // FEATURE 5: Array of image parts
+        temperature, 
+        maxOutputTokens, 
+        systemInstruction 
+    } = req.body;
     
     if (!history || history.length === 0) {
         res.write("Error: Conversation history is empty.");
@@ -36,26 +43,49 @@ app.post('/api/stream-chat', async (req, res) => {
 
     let contents = history; 
     
-    // Check if an image was uploaded in this turn (Multi-modal)
-    if (imagePart) {
+    // FEATURE 5: Handle MULTIPLE image parts (up to 4 supported by frontend)
+    if (imageParts && imageParts.length > 0) {
         const lastUserMessage = contents.pop(); 
         const multiModalMessage = {
             role: "user",
             parts: [
-                ...lastUserMessage.parts, 
-                imagePart                  
+                // Spread the user's text part(s)
+                ...lastUserMessage.parts.filter(p => p.text), 
+                // Spread the array of image parts
+                ...imageParts 
             ]
         };
         contents.push(multiModalMessage);
     }
     
+    // FEATURE 4: Define Safety Settings (Moderate Blocking)
+    // This is set to BLOCK_MEDIUM_AND_ABOVE by default for better user experience.
+    const safetySettings = [
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+    ];
+
     try {
         const stream = await ai.models.generateContentStream({
             model: "gemini-2.5-flash", 
             contents: contents, 
             config: {
-                // FEATURE ADDED: Enable Google Search for up-to-date grounding
+                // Existing feature: Google Search grounding
                 tools: [{ googleSearch: {} }], 
+                
+                // FEATURE 1: Temperature (Creativity)
+                temperature: temperature !== undefined ? parseFloat(temperature) : 0.7, 
+                
+                // FEATURE 3: Max Output Tokens
+                maxOutputTokens: maxOutputTokens !== undefined ? parseInt(maxOutputTokens) : 2048,
+                
+                // FEATURE 2: System Instruction/Personality
+                systemInstruction: systemInstruction || "You are CortexLuma, a powerful, witty, and highly helpful AI assistant built by Google. You excel at real-time data retrieval and coding tasks. Keep your answers concise, clear, and engaging.",
+                
+                // FEATURE 4: Safety Settings
+                safetySettings: safetySettings
             }
         });
 
@@ -67,7 +97,8 @@ app.post('/api/stream-chat', async (req, res) => {
         }
     } catch (error) {
         console.error("Gemini API Error:", error);
-        res.write(`Error: An internal API error occurred: ${error.message}`);
+        // Send a clearer error back to the client
+        res.write(`Error: An internal API error occurred. Details: ${error.message}`);
     } finally {
         res.end(); 
     }
