@@ -9,14 +9,15 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Increase limit for JSON body to allow for large Base64 image strings (up to 50MB)
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '200mb' }));
 
 // -----------------------------------------------------------------
-// 1. STREAMING TEXT CHAT ENDPOINT (Uses gemini-2.5-flash)
+// STREAMING TEXT/MULTI-MODAL CHAT ENDPOINT (Uses gemini-2.5-flash)
 // -----------------------------------------------------------------
 app.post('/api/stream-chat', async (req, res) => {
-    // Set headers for streaming (Server-Sent Events configuration)
+    // Set headers for streaming (Server-Sent Events configuration for plain text chunks)
     res.writeHead(200, {
         'Content-Type': 'text/plain; charset=utf-8',
         'Connection': 'keep-alive',
@@ -24,17 +25,37 @@ app.post('/api/stream-chat', async (req, res) => {
         'Transfer-Encoding': 'chunked'
     });
 
-    const { history } = req.body;
+    const { history, imagePart } = req.body;
     
     if (!history || history.length === 0) {
         res.write("Error: Conversation history is empty.");
         return res.end();
     }
 
+    // Start with the existing conversation history
+    let contents = history; 
+    
+    // Check if an image was uploaded in this turn
+    if (imagePart) {
+        // The last message in the history array is the new user text prompt.
+        // We pop it to modify it and add the image part to make it multi-modal.
+        const lastUserMessage = contents.pop(); 
+        
+        const multiModalMessage = {
+            role: "user",
+            parts: [
+                ...lastUserMessage.parts, // The text prompt (e.g., "What is this?")
+                imagePart                  // The Base64 image data
+            ]
+        };
+        // Push the combined multi-modal message back into the contents array
+        contents.push(multiModalMessage);
+    }
+    
     try {
         const stream = await ai.models.generateContentStream({
             model: "gemini-2.5-flash", 
-            contents: history, // Sends the full history array for multi-turn context
+            contents: contents, // Sends the modified history (with or without image)
         });
 
         // Read the stream and write chunks directly to the response
@@ -48,50 +69,10 @@ app.post('/api/stream-chat', async (req, res) => {
         console.error("Gemini API Error:", error);
         res.write(`Error: An internal API error occurred: ${error.message}`);
     } finally {
+        // Ensure the response is closed after the stream is finished or an error occurs
         res.end(); 
     }
 });
-
-// -----------------------------------------------------------------
-// 2. IMAGE GENERATION ENDPOINT (Uses imagen-3.0-generate-002)
-// -----------------------------------------------------------------
-app.post('/api/generate-image', async (req, res) => {
-    const { prompt } = req.body;
-
-    if (!prompt) {
-        return res.status(400).json({ error: "Image prompt is required." });
-    }
-
-    try {
-        const response = await ai.models.generateImages({
-            model: "imagen-3.0-generate-002", // Dedicated, high-quality Imagen model
-            prompt: prompt,
-            config: {
-                numberOfImages: 1,
-                aspectRatio: "1:1", // Square is standard, other options: "16:9", "4:3", etc.
-                outputMimeType: "image/png" // Ensure the output is PNG
-            },
-        });
-
-        // Extract Base64 image data and MIME type
-        const firstImage = response.generatedImages[0];
-        const base64Image = firstImage.image.imageBytes; 
-        const mimeType = firstImage.image.mimeType;
-
-        res.json({
-            image: {
-                data: base64Image,
-                mimeType: mimeType,
-            }
-        });
-
-    } catch (error) {
-        console.error("Imagen API Error:", error);
-        // Respond with a more user-friendly error
-        res.status(500).json({ error: `Image generation failed. This could be due to a safety violation in the prompt or an API error. Details: ${error.message}` });
-    }
-});
-
 
 app.listen(port, () => {
     console.log(`Server listening on port ${port}`);
