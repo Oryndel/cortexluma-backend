@@ -14,7 +14,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 // -----------------------------------------------------------------
-// 1. STREAMING CHAT ENDPOINT (Analysis: gemini-2.5-flash)
+// STREAMING CHAT ENDPOINT (Analysis: gemini-2.5-flash)
 // Handles multi-turn text chat and multi-modal image analysis.
 // -----------------------------------------------------------------
 app.post('/api/stream-chat', async (req, res) => {
@@ -68,44 +68,7 @@ app.post('/api/stream-chat', async (req, res) => {
     }
 });
 
-// -----------------------------------------------------------------
-// 2. IMAGE GENERATION ENDPOINT (Creation: imagen-3.0-generate-002)
-// This is a non-streaming endpoint for creating images.
-// -----------------------------------------------------------------
-app.post('/api/generate-image', async (req, res) => {
-    const { prompt } = req.body;
-
-    if (!prompt) {
-        return res.status(400).send({ error: "Prompt is required for image generation." });
-    }
-
-    try {
-        const response = await ai.models.generateImages({
-            model: 'imagen-3.0-generate-002', // The dedicated image generation model
-            prompt: prompt,
-            config: {
-                numberOfImages: 1,
-                outputMimeType: 'image/jpeg',
-                aspectRatio: '1:1', // You can change this to '16:9', '4:3', etc.
-            }
-        });
-
-        const image = response.generatedImages[0];
-        
-        // Respond with the Base64 image data and mime type
-        res.send({ 
-            base64Image: image.image.imageBytes, 
-            mimeType: image.image.mimeType 
-        });
-        
-    } catch (error) {
-        console.error("Imagen API Error:", error);
-        res.status(500).send({ 
-            error: "Image generation failed.", 
-            details: error.message 
-        });
-    }
-});
+// NOTE: The /api/generate-image endpoint has been completely removed.
 
 app.listen(port, () => {
     console.log(`Server listening on port ${port}`);
