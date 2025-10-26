@@ -14,7 +14,8 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 // -----------------------------------------------------------------
-// STREAMING TEXT/MULTI-MODAL CHAT ENDPOINT (Uses gemini-2.5-flash)
+// 1. STREAMING CHAT ENDPOINT (Analysis: gemini-2.5-flash)
+// Handles multi-turn text chat and multi-modal image analysis.
 // -----------------------------------------------------------------
 app.post('/api/stream-chat', async (req, res) => {
     // Set headers for streaming (Server-Sent Events configuration for plain text chunks)
@@ -32,33 +33,27 @@ app.post('/api/stream-chat', async (req, res) => {
         return res.end();
     }
 
-    // Start with the existing conversation history
     let contents = history; 
     
-    // Check if an image was uploaded in this turn
+    // Check if an image was uploaded in this turn (Multi-modal)
     if (imagePart) {
-        // The last message in the history array is the new user text prompt.
-        // We pop it to modify it and add the image part to make it multi-modal.
         const lastUserMessage = contents.pop(); 
-        
         const multiModalMessage = {
             role: "user",
             parts: [
-                ...lastUserMessage.parts, // The text prompt (e.g., "What is this?")
-                imagePart                  // The Base64 image data
+                ...lastUserMessage.parts, 
+                imagePart                  
             ]
         };
-        // Push the combined multi-modal message back into the contents array
         contents.push(multiModalMessage);
     }
     
     try {
         const stream = await ai.models.generateContentStream({
             model: "gemini-2.5-flash", 
-            contents: contents, // Sends the modified history (with or without image)
+            contents: contents, 
         });
 
-        // Read the stream and write chunks directly to the response
         for await (const chunk of stream) {
             const text = chunk.text;
             if (text) {
@@ -69,8 +64,46 @@ app.post('/api/stream-chat', async (req, res) => {
         console.error("Gemini API Error:", error);
         res.write(`Error: An internal API error occurred: ${error.message}`);
     } finally {
-        // Ensure the response is closed after the stream is finished or an error occurs
         res.end(); 
+    }
+});
+
+// -----------------------------------------------------------------
+// 2. IMAGE GENERATION ENDPOINT (Creation: imagen-3.0-generate-002)
+// This is a non-streaming endpoint for creating images.
+// -----------------------------------------------------------------
+app.post('/api/generate-image', async (req, res) => {
+    const { prompt } = req.body;
+
+    if (!prompt) {
+        return res.status(400).send({ error: "Prompt is required for image generation." });
+    }
+
+    try {
+        const response = await ai.models.generateImages({
+            model: 'imagen-3.0-generate-002', // The dedicated image generation model
+            prompt: prompt,
+            config: {
+                numberOfImages: 1,
+                outputMimeType: 'image/jpeg',
+                aspectRatio: '1:1', // You can change this to '16:9', '4:3', etc.
+            }
+        });
+
+        const image = response.generatedImages[0];
+        
+        // Respond with the Base64 image data and mime type
+        res.send({ 
+            base64Image: image.image.imageBytes, 
+            mimeType: image.image.mimeType 
+        });
+        
+    } catch (error) {
+        console.error("Imagen API Error:", error);
+        res.status(500).send({ 
+            error: "Image generation failed.", 
+            details: error.message 
+        });
     }
 });
 
