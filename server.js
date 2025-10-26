@@ -11,7 +11,7 @@ const port = process.env.PORT || 3000;
 
 // Increase limit for JSON body to allow for large Base64 image strings (up to 50MB)
 app.use(cors());
-app.use(express.json({ limit: '200mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 // -----------------------------------------------------------------
 // STREAMING TEXT/MULTI-MODAL CHAT ENDPOINT (Uses gemini-2.5-flash)
