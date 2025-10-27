@@ -2,8 +2,9 @@ import express from 'express';
 import cors from 'cors';
 import 'dotenv/config'; 
 import { GoogleGenAI } from "@google/genai";
+import fetch from 'node-fetch'; // Required for calling Freepik API
 
-// Initialize Gemini Client
+// --- Initialization ---
 // NOTE: Ensure your .env file has GEMINI_API_KEY="YOUR_KEY"
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const app = express();
@@ -14,8 +15,8 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 // -----------------------------------------------------------------
-// STREAMING CHAT ENDPOINT (Analysis: gemini-2.5-flash with Google Search)
-// Handles multi-turn chat, multi-image analysis, and configurable settings.
+// 1. GEMINI STREAMING CHAT ENDPOINT
+// Handles multi-turn chat, multi-image analysis, and configurable settings (System Instruction, Temp, Max Tokens).
 // -----------------------------------------------------------------
 app.post('/api/stream-chat', async (req, res) => {
     // Set headers for streaming (Server-Sent Events configuration for plain text chunks)
@@ -26,7 +27,6 @@ app.post('/api/stream-chat', async (req, res) => {
         'Transfer-Encoding': 'chunked'
     });
 
-    // Destructure new config parameters and multiple images
     const { 
         history, 
         imageParts, 
@@ -36,53 +36,44 @@ app.post('/api/stream-chat', async (req, res) => {
     } = req.body;
     
     if (!history || history.length === 0) {
-        res.write("Error: Conversation history is empty.");
+        res.write('Error: The chat history cannot be empty.');
         return res.end();
     }
-
-    let contents = history; 
     
-    // Handle MULTIPLE image parts (up to 4 supported by frontend)
+    // Combine history and new image parts for the contents array
+    const contents = [...history];
+
     if (imageParts && imageParts.length > 0) {
-        const lastUserMessage = contents.pop(); 
-        const multiModalMessage = {
-            role: "user",
-            parts: [
-                // Spread the user's text part(s)
-                ...lastUserMessage.parts.filter(p => p.text), 
-                // Spread the array of image parts
-                ...imageParts 
-            ]
-        };
-        contents.push(multiModalMessage);
+        // Find the last user message and append the new image parts to it
+        const lastUserMessage = contents[contents.length - 1];
+        if (lastUserMessage && lastUserMessage.role === 'user') {
+            // NOTE: The frontend should already include the text part of the last message
+            lastUserMessage.parts.push(...imageParts);
+        } else {
+            // Fallback: This should ideally not happen if history is structured correctly
+            contents.push({ role: 'user', parts: imageParts });
+        }
     }
     
-    // Define Safety Settings (Moderate Blocking)
+    // Define standard safety settings
     const safetySettings = [
-      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
-      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
-      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
-      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+        { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+        { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+        { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
     ];
 
+
     try {
+        // Start streaming response from Gemini
         const stream = await ai.models.generateContentStream({
             model: "gemini-2.5-flash", 
             contents: contents, 
             config: {
-                // FEATURE: Google Search grounding
-                tools: [{ googleSearch: {} }], 
-                
-                // FEATURE: Temperature (Creativity)
+                tools: [{ googleSearch: {} }], // Enable Google Search grounding
                 temperature: temperature !== undefined ? parseFloat(temperature) : 0.7, 
-                
-                // FEATURE: Max Output Tokens
                 maxOutputTokens: maxOutputTokens !== undefined ? parseInt(maxOutputTokens) : 2048,
-                
-                // FEATURE: System Instruction/Personality
                 systemInstruction: systemInstruction || "You are CortexLuma, a powerful, witty, and highly helpful AI assistant built by Google. You excel at real-time data retrieval and coding tasks. Keep your answers concise, clear, and engaging.",
-                
-                // FEATURE: Safety Settings
                 safetySettings: safetySettings
             }
         });
@@ -99,6 +90,58 @@ app.post('/api/stream-chat', async (req, res) => {
         res.write(`Error: An internal API error occurred. Please check the backend's GEMINI_API_KEY and logs. Details: ${error.message}`);
     } finally {
         res.end(); 
+    }
+});
+
+
+// -----------------------------------------------------------------
+// 2. FREEPIK AI IMAGE GENERATION ENDPOINT
+// Handles the /image command from the frontend.
+// -----------------------------------------------------------------
+app.post('/api/generate-image', async (req, res) => {
+    const { prompt } = req.body;
+    
+    if (!prompt) {
+        return res.status(400).json({ error: 'Prompt is required' });
+    }
+
+    try {
+        const FREEPIK_API_KEY = process.env.FREEPIK_API_KEY; 
+        
+        if (!FREEPIK_API_KEY) {
+            return res.status(500).json({ error: 'Freepik API key is missing. Please set FREEPIK_API_KEY in your .env file.' });
+        }
+
+        const response = await fetch('https://api.freepik.com/v1/ai/text-to-image', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-freepik-api-key': FREEPIK_API_KEY, 
+            },
+            body: JSON.stringify({
+                prompt: prompt,
+                // Recommended parameters for high quality
+                negative_prompt: "text, watermark, poor quality, bad anatomy, ugly, cartoon, blurry, low resolution, unrefined",
+                image: { size: "widescreen_16_9" }, // Landscape ratio
+                styling: { style: "photorealistic" }, 
+                num_images: 1
+            })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.results && data.results.length > 0) {
+            // Freepik returns an array of results, we take the first image's URL
+            const imageUrl = data.results[0].image_url; 
+            res.json({ imageUrl });
+        } else {
+            console.error("Freepik API Error Response:", data);
+            res.status(500).json({ error: data.message || 'Freepik image generation failed. Check backend logs for details.' });
+        }
+
+    } catch (error) {
+        console.error('Freepik Backend Error:', error);
+        res.status(500).json({ error: 'Internal server error while calling Freepik API.' });
     }
 });
 
