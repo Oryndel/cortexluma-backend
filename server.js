@@ -2,9 +2,9 @@ import express from 'express';
 import cors from 'cors';
 import 'dotenv/config'; 
 import { GoogleGenAI } from "@google/genai";
-import fetch from 'node-fetch'; // Required for calling Freepik API
+import fetch from 'node-fetch'; // Required for making external API calls like Imagen
 
-// --- Initialization ---
+// Initialize Gemini Client
 // NOTE: Ensure your .env file has GEMINI_API_KEY="YOUR_KEY"
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const app = express();
@@ -15,8 +15,8 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 // -----------------------------------------------------------------
-// 1. GEMINI STREAMING CHAT ENDPOINT
-// Handles multi-turn chat, multi-image analysis, and configurable settings (System Instruction, Temp, Max Tokens).
+// STREAMING CHAT ENDPOINT (Analysis: gemini-2.5-flash with Google Search)
+// Handles multi-turn chat, multi-image analysis, and configurable settings.
 // -----------------------------------------------------------------
 app.post('/api/stream-chat', async (req, res) => {
     // Set headers for streaming (Server-Sent Events configuration for plain text chunks)
@@ -27,6 +27,7 @@ app.post('/api/stream-chat', async (req, res) => {
         'Transfer-Encoding': 'chunked'
     });
 
+    // Destructure new config parameters and multiple images
     const { 
         history, 
         imageParts, 
@@ -36,44 +37,52 @@ app.post('/api/stream-chat', async (req, res) => {
     } = req.body;
     
     if (!history || history.length === 0) {
-        res.write('Error: The chat history cannot be empty.');
+        res.write('Error: Chat history is required.');
         return res.end();
     }
-    
-    // Combine history and new image parts for the contents array
+
+    // Combine chat history and uploaded images into one contents array
     const contents = [...history];
 
     if (imageParts && imageParts.length > 0) {
         // Find the last user message and append the new image parts to it
-        const lastUserMessage = contents[contents.length - 1];
-        if (lastUserMessage && lastUserMessage.role === 'user') {
-            // NOTE: The frontend should already include the text part of the last message
-            lastUserMessage.parts.push(...imageParts);
+        const lastUserIndex = contents.length - 1;
+        if (contents[lastUserIndex] && contents[lastUserIndex].role === 'user') {
+            contents[lastUserIndex].parts.push(...imageParts);
         } else {
-            // Fallback: This should ideally not happen if history is structured correctly
+            // This should not happen in a typical chat flow, but as a fallback:
             contents.push({ role: 'user', parts: imageParts });
         }
     }
     
-    // Define standard safety settings
+    // Add the current user query (the last item in history)
+    // The history array passed from the client should already contain the new user message.
+    
     const safetySettings = [
         { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
         { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
         { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
-        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" }
     ];
 
-
     try {
-        // Start streaming response from Gemini
         const stream = await ai.models.generateContentStream({
             model: "gemini-2.5-flash", 
             contents: contents, 
             config: {
-                tools: [{ googleSearch: {} }], // Enable Google Search grounding
+                // FEATURE: Google Search grounding
+                tools: [{ googleSearch: {} }], 
+                
+                // FEATURE: Temperature (Creativity)
                 temperature: temperature !== undefined ? parseFloat(temperature) : 0.7, 
+                
+                // FEATURE: Max Output Tokens
                 maxOutputTokens: maxOutputTokens !== undefined ? parseInt(maxOutputTokens) : 2048,
+                
+                // FEATURE: System Instruction/Personality
                 systemInstruction: systemInstruction || "You are CortexLuma, a powerful, witty, and highly helpful AI assistant built by Google. You excel at real-time data retrieval and coding tasks. Keep your answers concise, clear, and engaging.",
+                
+                // FEATURE: Safety Settings
                 safetySettings: safetySettings
             }
         });
@@ -93,57 +102,86 @@ app.post('/api/stream-chat', async (req, res) => {
     }
 });
 
-
 // -----------------------------------------------------------------
-// 2. FREEPIK AI IMAGE GENERATION ENDPOINT
-// Handles the /image command from the frontend.
+// IMAGE GENERATION ENDPOINT (Model: imagen-3.0-generate-002)
+// This uses a direct fetch to the API as per required implementation instructions.
 // -----------------------------------------------------------------
 app.post('/api/generate-image', async (req, res) => {
-    const { prompt } = req.body;
-    
-    if (!prompt) {
-        return res.status(400).json({ error: 'Prompt is required' });
-    }
-
     try {
-        const FREEPIK_API_KEY = process.env.FREEPIK_API_KEY; 
-        
-        if (!FREEPIK_API_KEY) {
-            return res.status(500).json({ error: 'Freepik API key is missing. Please set FREEPIK_API_KEY in your .env file.' });
+        const { prompt } = req.body;
+        if (!prompt) {
+            // Respond with a 400 Bad Request if the prompt is missing
+            return res.status(400).json({ error: 'Prompt is required for image generation.' });
         }
 
-        const response = await fetch('https://api.freepik.com/v1/ai/text-to-image', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-freepik-api-key': FREEPIK_API_KEY, 
-            },
-            body: JSON.stringify({
-                prompt: prompt,
-                // Recommended parameters for high quality
-                negative_prompt: "text, watermark, poor quality, bad anatomy, ugly, cartoon, blurry, low resolution, unrefined",
-                image: { size: "widescreen_16_9" }, // Landscape ratio
-                styling: { style: "photorealistic" }, 
-                num_images: 1
-            })
-        });
+        // Configuration for the Imagen 3.0 API call
+        const apiKey = process.env.GEMINI_API_KEY || "";
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key=${apiKey}`;
 
-        const data = await response.json();
+        const payload = { 
+            instances: [{ prompt: prompt }], 
+            parameters: { "sampleCount": 1 } 
+        };
 
-        if (response.ok && data.results && data.results.length > 0) {
-            // Freepik returns an array of results, we take the first image's URL
-            const imageUrl = data.results[0].image_url; 
-            res.json({ imageUrl });
+        // Retry mechanism for API calls (Exponential Backoff)
+        let fetchResponse;
+        const maxRetries = 3;
+        let delay = 1000; 
+
+        for (let i = 0; i < maxRetries; i++) {
+            try {
+                fetchResponse = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (fetchResponse.ok) {
+                    break; // Success, exit loop
+                } else if (fetchResponse.status === 429 || fetchResponse.status >= 500) {
+                    // Too Many Requests or Server Error, retry after delay
+                    if (i === maxRetries - 1) {
+                         // Last attempt failed
+                         throw new Error(`API failed after ${maxRetries} retries with status: ${fetchResponse.status}`);
+                    }
+                    console.warn(`Retry attempt ${i + 1} for Imagen API after status ${fetchResponse.status}. Delaying for ${delay}ms...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    delay *= 2; // Exponential backoff
+                } else {
+                    // Non-retryable error (e.g., 400 Bad Request, 401 Unauthorized)
+                    const errorBody = await fetchResponse.json();
+                    throw new Error(`External Image API Error (${fetchResponse.status}): ${errorBody.error?.message || 'Unknown error'}`);
+                }
+            } catch (error) {
+                if (i === maxRetries - 1) throw error; // Re-throw if it's the last attempt
+                // Non-HTTP errors (e.g., network issues) also trigger backoff
+                await new Promise(resolve => setTimeout(resolve, delay));
+                delay *= 2; 
+            }
+        }
+        
+        const result = await fetchResponse.json();
+        
+        // Extract the base64 data as per instruction
+        const base64Data = result?.predictions?.[0]?.bytesBase64Encoded;
+
+        if (base64Data) {
+            // Respond with the base64 data wrapped in a data URL as JSON
+            const imageUrl = `data:image/png;base64,${base64Data}`;
+            res.json({ imageUrl: imageUrl });
         } else {
-            console.error("Freepik API Error Response:", data);
-            res.status(500).json({ error: data.message || 'Freepik image generation failed. Check backend logs for details.' });
+            // Log full API response if data is missing for debugging
+            console.error('Image generation response missing data:', result);
+            res.status(500).json({ error: 'Image generation failed: No image data received.' });
         }
 
     } catch (error) {
-        console.error('Freepik Backend Error:', error);
-        res.status(500).json({ error: 'Internal server error while calling Freepik API.' });
+        console.error('Image Generation Backend Error:', error.message);
+        // Ensure the response is always JSON for the frontend to handle
+        res.status(500).json({ error: `Image generation failed: ${error.message}` });
     }
 });
+
 
 app.listen(port, () => {
     console.log(`Server listening on port ${port}`);
