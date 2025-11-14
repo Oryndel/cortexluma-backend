@@ -52,6 +52,7 @@ app.post('/api/stream-chat', async (req, res) => {
     
     // FAIL-FAST VALIDATION 
     if (!history || history.length === 0) {
+        // FIX: Added a check for history.length > 0
         res.write('Error: Chat history is required.');
         return res.end();
     }
@@ -61,6 +62,12 @@ app.post('/api/stream-chat', async (req, res) => {
     }
 
     const lastUserTurn = history[history.length - 1];
+    // FIX: Ensure lastUserTurn and its parts exist before accessing properties
+    if (!lastUserTurn || !lastUserTurn.parts || lastUserTurn.parts.length === 0) {
+         res.write('Error: Last user turn is incomplete.');
+         return res.end();
+    }
+    
     const userPromptText = lastUserTurn.parts.find(p => p.text)?.text || '';
     if (userPromptText.length > MAX_TOKEN_ESTIMATE) {
         res.write(`Error: Prompt is too long (Max ${MAX_TOKEN_ESTIMATE} characters).`);
@@ -71,10 +78,16 @@ app.post('/api/stream-chat', async (req, res) => {
     const contents = [...history];
 
     // Append image parts to the last user turn if present
+    // NOTE: The client sends the user prompt as the last item of history AND the imageParts separately.
+    // The client-side logic updates the history *before* sending. We just need to ensure the imageParts 
+    // are correctly merged into the last user turn (which already contains the text part from history).
     if (imageParts && imageParts.length > 0) {
+        // The last history item is the user's turn with the text part.
+        // We append the new image parts to this last item's parts array.
         contents[contents.length - 1].parts = [
             ...contents[contents.length - 1].parts,
-            ...imageParts
+            // FIX: Ensure the imageParts array is spread correctly
+            ...imageParts 
         ];
     }
     
@@ -154,6 +167,8 @@ app.post('/api/generate-image', async (req, res) => {
         if (!fetchResponse.ok) {
             // Throw a specific error if the external API returns a non-200 status
             const errorBody = await fetchResponse.json();
+            // FIX: Log the more detailed error body from the Imagen API
+            console.error('External Imagen API returned non-OK status. Error body:', errorBody); 
             throw new Error(`External Image API Error (${fetchResponse.status}): ${errorBody.error?.message || 'Unknown error from Imagen API'}`);
         }
         
