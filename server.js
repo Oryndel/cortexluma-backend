@@ -38,104 +38,141 @@ app.get('/', (req, res) => {
 });
 
 // -----------------------------------------------------------------
-// STREAMING CHAT ENDPOINT
+// STREAMING CHAT ENDPOINT (Analysis: gemini-2.5-flash with Google Search)
+// Optimized for maximum streaming speed and aggressive retry on initial connection.
 // -----------------------------------------------------------------
 app.post('/api/stream-chat', async (req, res) => {
-    const { history, prompt, image } = req.body;
+    // 1. Initial validation
+    const { history, prompt, base64Image } = req.body;
 
-    // 1. Fail-Fast Validation
-    if (!GEMINI_API_KEY) {
-        return res.status(500).send("Error: API Key not configured on the server.");
+    if (!prompt) {
+        return res.status(400).json({ error: "Prompt is required." });
     }
-    if (!history || !Array.isArray(history) || typeof prompt !== 'string') {
-        return res.status(400).send('Invalid request: `history` and `prompt` are required.');
+
+    if (prompt.length > MAX_PROMPT_LENGTH) {
+        return res.status(400).json({ error: `Prompt exceeds maximum length of ${MAX_PROMPT_LENGTH} characters.` });
     }
-    if (history.length > MAX_HISTORY_LENGTH || prompt.length > MAX_PROMPT_LENGTH) {
-        return res.status(400).send('Request exceeds maximum length limit.');
+
+    // 2. Construct chat history
+    const chatHistory = history ? [...history].slice(-MAX_HISTORY_LENGTH) : [];
+
+    // Add current user prompt (and image, if provided)
+    const userParts = [{ text: prompt }];
+
+    if (base64Image) {
+        try {
+            // base64Image is expected to be a data URL (e.g., 'data:image/jpeg;base64,...')
+            const [mimeTypePart, base64Data] = base64Image.split(';base64,');
+            const mimeType = mimeTypePart.split(':')[1];
+            
+            if (!mimeType || !base64Data) {
+                throw new Error("Invalid base64 image format.");
+            }
+
+            userParts.push({
+                inlineData: {
+                    mimeType: mimeType,
+                    data: base64Data
+                }
+            });
+        } catch (e) {
+            console.error("Image parsing error:", e.message);
+            return res.status(400).json({ error: "Invalid image data provided." });
+        }
+    }
+
+    chatHistory.push({ role: "user", parts: userParts });
+
+    // 3. Configure response headers for streaming
+    res.setHeader('Content-Type', 'text/plain'); // Sending raw text chunks
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.status(200);
+
+    const MAX_RETRIES = 3;
+    let retries = 0;
+    let responseStream;
+
+    while (retries < MAX_RETRIES) {
+        try {
+            // 4. Call Gemini API with Exponential Backoff
+            responseStream = await ai.models.generateContentStream({
+                model: "gemini-2.5-flash",
+                contents: chatHistory,
+                config: {
+                    // Enable Google Search grounding tool
+                    tools: [{ googleSearch: {} }],
+                },
+            });
+
+            // If successful, break the retry loop
+            break; 
+
+        } catch (error) {
+            retries++;
+            if (retries >= MAX_RETRIES) {
+                console.error(`FATAL: Gemini API call failed after ${MAX_RETRIES} retries.`, error.message);
+                // Clean up response stream and close connection on fatal error
+                res.end(`[STREAM_ERROR] Gemini API failed: ${error.message}`);
+                return;
+            }
+            // Implement exponential backoff delay
+            const delay = Math.pow(2, retries) * 1000;
+            console.warn(`Gemini API connection failed (Attempt ${retries}/${MAX_RETRIES}). Retrying in ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+
+    if (!responseStream) {
+        // This case should not happen if the retry loop is correctly structured, but acts as a safeguard.
+        return res.end("[STREAM_ERROR] Could not initialize Gemini stream.");
     }
     
-    // Set headers for streaming response
-    res.writeHead(200, {
-        'Content-Type': 'text/plain; charset=utf-8',
-        'Transfer-Encoding': 'chunked',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-    });
-
+    // 5. Stream the response chunks to the client
     try {
-        const contents = [...history]; 
-
-        // Add the current user prompt (and optional image)
-        const userParts = [{ text: prompt }];
-        if (image && image.data && image.mimeType) {
-            // Add image part for multimodal requests
-            userParts.push({ inlineData: { data: image.data, mimeType: image.mimeType } });
-        }
-        contents.push({ role: 'user', parts: userParts });
-
-        // Configuration for fast streaming and grounding
-        const model = 'gemini-2.5-flash';
-        const generationConfig = {
-            systemInstruction: "You are CortexLuma, a helpful and concise AI assistant. Answer the user's questions clearly, and provide relevant sources if using Google Search grounding.",
-            temperature: 0.2
-        };
-
-        const responseStream = await ai.models.generateContentStream({
-            model: model,
-            contents: contents,
-            config: {
-                ...generationConfig,
-                tools: [{ google_search: {} }] // Enable Google Search grounding
-            }
-        });
-
-        // Stream the response chunks directly to the client
         for await (const chunk of responseStream) {
             if (chunk.text) {
-                // Write the text content
                 res.write(chunk.text);
             }
-            
-            // Collect grounding sources from the final chunk
-            if (chunk.groundingMetadata?.groundingAttributions) {
-                const sources = chunk.groundingMetadata.groundingAttributions.map(attr => ({
-                    uri: attr.web?.uri,
-                    title: attr.web?.title
-                })).filter(source => source.uri); // Filter out any incomplete sources
 
-                // Send a special marker for the end of the text and sources
-                res.write(`\n--SOURCES--\n${JSON.stringify(sources)}`);
+            // Stream citations when available (only included in the final chunk)
+            if (chunk.candidates?.[0]?.groundingMetadata?.groundingAttributions) {
+                const attributions = chunk.candidates[0].groundingMetadata.groundingAttributions;
+                const sources = attributions.map(attr => ({
+                    uri: attr.web?.uri,
+                    title: attr.web?.title,
+                })).filter(source => source.uri && source.title);
+
+                if (sources.length > 0) {
+                    // Send a special JSON marker for the frontend to parse
+                    // The frontend must parse any line starting with [METADATA]
+                    res.write(`\n[METADATA]${JSON.stringify({ sources: sources })}`);
+                }
             }
         }
-        
-        // End the response stream
-        res.end();
-
     } catch (error) {
-        console.error('Chat Streaming Backend Error:', error.message);
-        // Send the error message back to the client as plain text before ending the stream
-        res.write(`\n--ERROR--\n${error.message}`);
+        console.error("Error during streaming:", error.message);
+        res.end(`\n[STREAM_ERROR] Streaming connection lost: ${error.message}`);
+    } finally {
+        // 6. End the response stream
         res.end();
     }
 });
 
 
 // -----------------------------------------------------------------
-// IMAGE GENERATION ENDPOINT
+// IMAGE GENERATION ENDPOINT (Imagen 4.0)
+// Uses node-fetch to call the external service
 // -----------------------------------------------------------------
 const IMAGEN_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict";
 
 app.post('/api/generate-image', async (req, res) => {
     const { prompt } = req.body;
 
-    if (!GEMINI_API_KEY) {
-        return res.status(500).json({ error: "Error: API Key not configured on the server." });
+    if (!prompt) {
+        return res.status(400).json({ error: "Prompt is required for image generation." });
     }
-    if (!prompt || typeof prompt !== 'string' || prompt.length < 5) {
-        return res.status(400).json({ error: 'Invalid prompt. Please provide a descriptive prompt (min 5 chars).' });
-    }
-    
-    // Construct the payload for the Imagen API
+
     const payload = {
         instances: {
             prompt: prompt
@@ -146,9 +183,11 @@ app.post('/api/generate-image', async (req, res) => {
         } 
     };
     
+    // NOTE: This endpoint uses a single, non-retried fetch call for fast feedback.
     try {
         const fetchResponse = await fetch(IMAGEN_API_URL, {
             method: 'POST',
+            // CRITICAL: We pass the API key via a header for Imagen API
             headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': GEMINI_API_KEY },
             body: JSON.stringify(payload)
         });
@@ -178,5 +217,5 @@ app.post('/api/generate-image', async (req, res) => {
 
 
 app.listen(port, () => {
-    console.log(`CortexLuma Backend listening on port ${port}`);
+    console.log(`Server listening on port ${port} (http://localhost:${port})`);
 });
