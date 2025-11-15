@@ -1,200 +1,188 @@
 import express from 'express';
 import cors from 'cors';
 import 'dotenv/config'; 
-import fetch from 'node-fetch'; 
 import { GoogleGenAI } from "@google/genai";
+import fetch from 'node-fetch'; // Required for making external API calls like Imagen
 
-// --- Configuration and Initialization ---
-
-// CRITICAL CHECK: Ensure API Key is available
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-if (!GEMINI_API_KEY) {
-    console.error("FATAL ERROR: GEMINI_API_KEY is missing. Please ensure your environment variable is set.");
-    // The server will proceed but API calls will fail immediately.
-}
-
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+// Initialize Gemini Client
+// NOTE: Ensure your .env file has GEMINI_API_KEY="YOUR_KEY"
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Set hard limits for fast response (Fail-Fast Validation)
-const MAX_HISTORY_LENGTH = 50; // Max turns of history
-const MAX_PROMPT_LENGTH = 15000; // Max characters in the current turn
-
-// Middleware Setup
-// FIX: Explicitly set CORS origin to allow your frontend URL (GitHub Pages) and local testing
-app.use(cors({
-    origin: ['https://oryndel.github.io', 'http://localhost:3000', 'https://oryndel.github.io/cortexluma'],
-    methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type'],
-}));
+// Increase limit for JSON body to allow for large Base64 image strings (up to 50MB)
+app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 // -----------------------------------------------------------------
-// HEALTH CHECK / ROOT ENDPOINT
-// -----------------------------------------------------------------
-app.get('/', (req, res) => {
-    res.status(200).json({
-        status: 'OK',
-        message: 'CortexLuma AI Backend is running. Use /api/stream-chat or /api/generate-image via POST.',
-        version: '1.0.2'
-    });
-});
-
-// -----------------------------------------------------------------
-// STREAMING CHAT ENDPOINT
+// STREAMING CHAT ENDPOINT (Analysis: gemini-2.5-flash with Google Search)
+// Handles multi-turn chat, multi-image analysis, and configurable settings.
 // -----------------------------------------------------------------
 app.post('/api/stream-chat', async (req, res) => {
-    // Destructure all fields from the frontend payload
-    const { history, prompt, imageParts, temperature, maxOutputTokens, systemInstruction } = req.body; 
-
-    // 1. Fail-Fast Validation
-    if (!GEMINI_API_KEY) {
-        return res.status(500).send("Error: API Key not configured on the server.");
-    }
-    if (!history || !Array.isArray(history) || typeof prompt !== 'string') {
-        return res.status(400).send('Invalid request: `history` and `prompt` are required.');
-    }
-    if (history.length > MAX_HISTORY_LENGTH || prompt.length > MAX_PROMPT_LENGTH) {
-        return res.status(400).send('Request exceeds maximum length limit.');
-    }
-    
-    // Set headers for streaming response
+    // Set headers for streaming (Server-Sent Events configuration for plain text chunks)
     res.writeHead(200, {
         'Content-Type': 'text/plain; charset=utf-8',
-        'Transfer-Encoding': 'chunked',
+        'Connection': 'keep-alive',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
+        'Transfer-Encoding': 'chunked'
     });
 
-    try {
-        const contents = [...history]; 
+    // Destructure new config parameters and multiple images
+    const { 
+        history, 
+        imageParts, 
+        temperature, 
+        maxOutputTokens, 
+        systemInstruction 
+    } = req.body;
+    
+    if (!history || history.length === 0) {
+        res.write('Error: Chat history is required.');
+        return res.end();
+    }
 
-        // Add the current user prompt (and optional image(s))
-        const userParts = [{ text: prompt }];
-        
-        // Handle imageParts array (multi-image support)
-        if (imageParts && Array.isArray(imageParts)) {
-            imageParts.forEach(part => {
-                if (part.inlineData) {
-                    userParts.push(part.inlineData); // Push the inlineData part
-                }
-            });
+    // Combine chat history and uploaded images into one contents array
+    const contents = [...history];
+
+    if (imageParts && imageParts.length > 0) {
+        // Find the last user message and append the new image parts to it
+        const lastUserIndex = contents.length - 1;
+        if (contents[lastUserIndex] && contents[lastUserIndex].role === 'user') {
+            contents[lastUserIndex].parts.push(...imageParts);
+        } else {
+            // This should not happen in a typical chat flow, but as a fallback:
+            contents.push({ role: 'user', parts: imageParts });
         }
-        contents.push({ role: 'user', parts: userParts });
+    }
+    
+    // Add the current user query (the last item in history)
+    // The history array passed from the client should already contain the new user message.
+    
+    const safetySettings = [
+        { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+        { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+        { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" }
+    ];
 
-        // Configuration for fast streaming and grounding
-        const model = 'gemini-2.5-flash';
-        
-        // Use dynamic settings from the request body
-        const defaultInstruction = "You are CortexLuma, a helpful and concise AI assistant. Answer the user's questions clearly, and provide relevant sources if using Google Search grounding.";
-        
-        const generationConfig = {
-            // Use systemInstruction from the body, falling back to the default
-            systemInstruction: systemInstruction || defaultInstruction, 
-            // Use temperature from the body, falling back to 0.2
-            temperature: temperature !== undefined ? parseFloat(temperature) : 0.2, 
-            // Use maxOutputTokens from the body, or undefined to use model default
-            maxOutputTokens: maxOutputTokens !== undefined ? parseInt(maxOutputTokens) : undefined 
-        };
-
-        const responseStream = await ai.models.generateContentStream({
-            model: model,
-            contents: contents,
+    try {
+        const stream = await ai.models.generateContentStream({
+            model: "gemini-2.5-flash", 
+            contents: contents, 
             config: {
-                ...generationConfig,
-                tools: [{ google_search: {} }] // Enable Google Search grounding
+                // FEATURE: Google Search grounding
+                tools: [{ googleSearch: {} }], 
+                
+                // FEATURE: Temperature (Creativity)
+                temperature: temperature !== undefined ? parseFloat(temperature) : 0.7, 
+                
+                // FEATURE: Max Output Tokens
+                maxOutputTokens: maxOutputTokens !== undefined ? parseInt(maxOutputTokens) : 2048,
+                
+                // FEATURE: System Instruction/Personality
+                systemInstruction: systemInstruction || "You are CortexLuma, a powerful, witty, and highly helpful AI assistant built by Google. You excel at real-time data retrieval and coding tasks. Keep your answers concise, clear, and engaging.",
+                
+                // FEATURE: Safety Settings
+                safetySettings: safetySettings
             }
         });
 
-        // Stream the response chunks directly to the client
-        for await (const chunk of responseStream) {
-            if (chunk.text) {
-                // Write the text content
-                res.write(chunk.text);
-            }
-            
-            // Collect grounding sources from the final chunk
-            if (chunk.groundingMetadata?.groundingAttributions) {
-                const sources = chunk.groundingMetadata.groundingAttributions.map(attr => ({
-                    uri: attr.web?.uri,
-                    title: attr.web?.title
-                })).filter(source => source.uri); // Filter out any incomplete sources
-
-                // Send a special marker for the end of the text and sources
-                res.write(`\n--SOURCES--\n${JSON.stringify(sources)}`);
+        for await (const chunk of stream) {
+            const text = chunk.text;
+            if (text) {
+                res.write(text);
             }
         }
-        
-        // End the response stream
-        res.end();
-
     } catch (error) {
-        console.error('Chat Streaming Backend Error:', error.message);
-        // Send the error message back to the client as plain text before ending the stream
-        res.write(`\n--ERROR--\n${error.message}`);
-        res.end();
+        console.error("Gemini API Error:", error);
+        // Send a clearer error back to the client
+        res.write(`Error: An internal API error occurred. Please check the backend's GEMINI_API_KEY and logs. Details: ${error.message}`);
+    } finally {
+        res.end(); 
     }
 });
 
-
 // -----------------------------------------------------------------
-// IMAGE GENERATION ENDPOINT (No changes needed, but included for completeness)
+// IMAGE GENERATION ENDPOINT (Model: imagen-3.0-generate-002)
+// This uses a direct fetch to the API as per required implementation instructions.
 // -----------------------------------------------------------------
-const IMAGEN_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict";
-
 app.post('/api/generate-image', async (req, res) => {
-    const { prompt } = req.body;
-
-    if (!GEMINI_API_KEY) {
-        return res.status(500).json({ error: "Error: API Key not configured on the server." });
-    }
-    if (!prompt || typeof prompt !== 'string' || prompt.length < 5) {
-        return res.status(400).json({ error: 'Invalid prompt. Please provide a descriptive prompt (min 5 chars).' });
-    }
-    
-    // Construct the payload for the Imagen API
-    const payload = {
-        instances: {
-            prompt: prompt
-        },
-        parameters: {
-            "sampleCount": 1,
-            "aspectRatio": "1:1" 
-        } 
-    };
-    
     try {
-        const fetchResponse = await fetch(IMAGEN_API_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': GEMINI_API_KEY },
-            body: JSON.stringify(payload)
-        });
+        const { prompt } = req.body;
+        if (!prompt) {
+            // Respond with a 400 Bad Request if the prompt is missing
+            return res.status(400).json({ error: 'Prompt is required for image generation.' });
+        }
 
-        if (!fetchResponse.ok) {
-            const errorBody = await fetchResponse.json();
-            console.error('External Image API Error Response:', errorBody);
-            throw new Error(`External Image API Error (${fetchResponse.status}): ${errorBody.error?.message || 'Unknown error from Imagen API'}`);
+        // Configuration for the Imagen 3.0 API call
+        const apiKey = process.env.GEMINI_API_KEY || "";
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key=${apiKey}`;
+
+        const payload = { 
+            instances: [{ prompt: prompt }], 
+            parameters: { "sampleCount": 1 } 
+        };
+
+        // Retry mechanism for API calls (Exponential Backoff)
+        let fetchResponse;
+        const maxRetries = 3;
+        let delay = 1000; 
+
+        for (let i = 0; i < maxRetries; i++) {
+            try {
+                fetchResponse = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (fetchResponse.ok) {
+                    break; // Success, exit loop
+                } else if (fetchResponse.status === 429 || fetchResponse.status >= 500) {
+                    // Too Many Requests or Server Error, retry after delay
+                    if (i === maxRetries - 1) {
+                         // Last attempt failed
+                         throw new Error(`API failed after ${maxRetries} retries with status: ${fetchResponse.status}`);
+                    }
+                    console.warn(`Retry attempt ${i + 1} for Imagen API after status ${fetchResponse.status}. Delaying for ${delay}ms...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    delay *= 2; // Exponential backoff
+                } else {
+                    // Non-retryable error (e.g., 400 Bad Request, 401 Unauthorized)
+                    const errorBody = await fetchResponse.json();
+                    throw new Error(`External Image API Error (${fetchResponse.status}): ${errorBody.error?.message || 'Unknown error'}`);
+                }
+            } catch (error) {
+                if (i === maxRetries - 1) throw error; // Re-throw if it's the last attempt
+                // Non-HTTP errors (e.g., network issues) also trigger backoff
+                await new Promise(resolve => setTimeout(resolve, delay));
+                delay *= 2; 
+            }
         }
         
         const result = await fetchResponse.json();
+        
+        // Extract the base64 data as per instruction
         const base64Data = result?.predictions?.[0]?.bytesBase64Encoded;
 
         if (base64Data) {
+            // Respond with the base64 data wrapped in a data URL as JSON
             const imageUrl = `data:image/png;base64,${base64Data}`;
             res.json({ imageUrl: imageUrl });
         } else {
+            // Log full API response if data is missing for debugging
             console.error('Image generation response missing data:', result);
             res.status(500).json({ error: 'Image generation failed: No image data received.' });
         }
 
     } catch (error) {
         console.error('Image Generation Backend Error:', error.message);
+        // Ensure the response is always JSON for the frontend to handle
         res.status(500).json({ error: `Image generation failed: ${error.message}` });
     }
 });
 
 
 app.listen(port, () => {
-    console.log(`CortexLuma Backend listening on port ${port}`);
+    console.log(`Server listening on port ${port}`);
 });
