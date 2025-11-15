@@ -1,7 +1,7 @@
 {
-  "name": "gemini-ai-backend",
-  "version": "1.0.0",
-  "description": "Backend for CortexLuma AI Chatbot (Express with Gemini and Freepik integration)",
+  "name": "cortexluma-ai-backend",
+  "version": "1.0.1",
+  "description": "Backend for CortexLuma AI Chatbot, featuring multi-modal Gemini streaming chat and Imagen image generation.",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -16,8 +16,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.0.0",
     "express": "^4.18.2",
-    "node-fetch": "^3.3.2",
-    "pdfkit": "^0.14.0"  <-- ADD THIS DEPENDENCY
+    "node-fetch": "^3.3.2"
   },
   "devDependencies": {
     "nodemon": "^2.0.22"
@@ -27,7 +26,8 @@
     "express",
     "ai",
     "backend",
-    "streaming"
+    "streaming",
+    "multimodal"
   ],
   "license": "MIT"
 }
