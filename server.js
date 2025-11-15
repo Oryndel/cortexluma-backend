@@ -4,28 +4,24 @@ import 'dotenv/config';
 import fetch from 'node-fetch'; 
 import { GoogleGenAI } from "@google/genai";
 
-// Initialize Gemini Client
-// NOTE: Ensure your .env file has GEMINI_API_KEY="YOUR_KEY"
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// --- Configuration and Initialization ---
 
-// --- CRITICAL DEBUGGING CHECK ---
-if (process.env.GEMINI_API_KEY) {
-    console.log("SUCCESS: GEMINI_API_KEY is loaded. Server starting...");
-} else {
-    // This is the most common cause of server errors.
-    console.error("FATAL ERROR: GEMINI_API_KEY is missing or undefined.");
-    console.error("Please ensure you have a .env file with GEMINI_API_KEY=\"YOUR_KEY\"");
-    // The server will technically start, but API calls will fail immediately with 400/500 errors.
+// CRITICAL CHECK: Ensure API Key is available
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+if (!GEMINI_API_KEY) {
+    console.error("FATAL ERROR: GEMINI_API_KEY is missing. Please ensure your environment variable is set.");
+    // The server will proceed but API calls will fail immediately.
 }
-// --- END DEBUGGING CHECK ---
 
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 const app = express();
 const port = process.env.PORT || 3000;
 
 // Set hard limits for fast response (Fail-Fast Validation)
 const MAX_HISTORY_LENGTH = 50; // Max turns of history
-const MAX_TOKEN_ESTIMATE = 10000; // Max characters/tokens in the current turn
+const MAX_PROMPT_LENGTH = 15000; // Max characters in the current turn
 
+// Middleware Setup
 // Increase limit for JSON body to allow for large Base64 image strings (up to 50MB)
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -37,22 +33,25 @@ app.get('/', (req, res) => {
     res.status(200).json({
         status: 'OK',
         message: 'CortexLuma AI Backend is running. Use /api/stream-chat or /api/generate-image via POST.',
-        version: '1.0.1'
+        version: '1.0.2'
     });
 });
 
 // -----------------------------------------------------------------
-// STREAMING CHAT ENDPOINT (Optimized for Maximum Speed - Fail Fast)
+// STREAMING CHAT ENDPOINT
 // -----------------------------------------------------------------
 app.post('/api/stream-chat', async (req, res) => {
-    const { history, prompt, image, user_id } = req.body;
+    const { history, prompt, image } = req.body;
 
     // 1. Fail-Fast Validation
-    if (!history || !Array.isArray(history) || typeof prompt !== 'string') {
-        return res.status(400).json({ error: 'Invalid request: `history` and `prompt` are required.' });
+    if (!GEMINI_API_KEY) {
+        return res.status(500).send("Error: API Key not configured on the server.");
     }
-    if (history.length > MAX_HISTORY_LENGTH || prompt.length > MAX_TOKEN_ESTIMATE) {
-        return res.status(400).json({ error: 'Request exceeds maximum history or prompt length limit.' });
+    if (!history || !Array.isArray(history) || typeof prompt !== 'string') {
+        return res.status(400).send('Invalid request: `history` and `prompt` are required.');
+    }
+    if (history.length > MAX_HISTORY_LENGTH || prompt.length > MAX_PROMPT_LENGTH) {
+        return res.status(400).send('Request exceeds maximum length limit.');
     }
     
     // Set headers for streaming response
@@ -64,7 +63,7 @@ app.post('/api/stream-chat', async (req, res) => {
     });
 
     try {
-        const contents = [...history]; // Copy existing history
+        const contents = [...history]; 
 
         // Add the current user prompt (and optional image)
         const userParts = [{ text: prompt }];
@@ -81,7 +80,6 @@ app.post('/api/stream-chat', async (req, res) => {
             temperature: 0.2
         };
 
-        // Streaming is the fastest way to get the Time-To-First-Byte (TTFB) down
         const responseStream = await ai.models.generateContentStream({
             model: model,
             contents: contents,
@@ -94,15 +92,17 @@ app.post('/api/stream-chat', async (req, res) => {
         // Stream the response chunks directly to the client
         for await (const chunk of responseStream) {
             if (chunk.text) {
+                // Write the text content
                 res.write(chunk.text);
             }
             
             // Collect grounding sources from the final chunk
             if (chunk.groundingMetadata?.groundingAttributions) {
                 const sources = chunk.groundingMetadata.groundingAttributions.map(attr => ({
-                    uri: attr.web.uri,
-                    title: attr.web.title
-                }));
+                    uri: attr.web?.uri,
+                    title: attr.web?.title
+                })).filter(source => source.uri); // Filter out any incomplete sources
+
                 // Send a special marker for the end of the text and sources
                 res.write(`\n--SOURCES--\n${JSON.stringify(sources)}`);
             }
@@ -112,7 +112,6 @@ app.post('/api/stream-chat', async (req, res) => {
         res.end();
 
     } catch (error) {
-        // Log the detailed error on the server side
         console.error('Chat Streaming Backend Error:', error.message);
         // Send the error message back to the client as plain text before ending the stream
         res.write(`\n--ERROR--\n${error.message}`);
@@ -122,16 +121,18 @@ app.post('/api/stream-chat', async (req, res) => {
 
 
 // -----------------------------------------------------------------
-// IMAGE GENERATION ENDPOINT (Analysis: imagen-4.0-generate-001)
-// Already configured for MAX SPEED (Fail-Fast)
+// IMAGE GENERATION ENDPOINT
 // -----------------------------------------------------------------
 const IMAGEN_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict";
 
 app.post('/api/generate-image', async (req, res) => {
     const { prompt } = req.body;
 
+    if (!GEMINI_API_KEY) {
+        return res.status(500).json({ error: "Error: API Key not configured on the server." });
+    }
     if (!prompt || typeof prompt !== 'string' || prompt.length < 5) {
-        return res.status(400).json({ error: 'Invalid prompt. Please provide a descriptive prompt.' });
+        return res.status(400).json({ error: 'Invalid prompt. Please provide a descriptive prompt (min 5 chars).' });
     }
     
     // Construct the payload for the Imagen API
@@ -145,17 +146,16 @@ app.post('/api/generate-image', async (req, res) => {
         } 
     };
     
-    // MAX SPEED: Fail fast and directly; no retry logic.
     try {
         const fetchResponse = await fetch(IMAGEN_API_URL, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': GEMINI_API_KEY },
             body: JSON.stringify(payload)
         });
 
         if (!fetchResponse.ok) {
-            // Throw a specific error if the external API returns a non-200 status
             const errorBody = await fetchResponse.json();
+            console.error('External Image API Error Response:', errorBody);
             throw new Error(`External Image API Error (${fetchResponse.status}): ${errorBody.error?.message || 'Unknown error from Imagen API'}`);
         }
         
@@ -172,12 +172,11 @@ app.post('/api/generate-image', async (req, res) => {
 
     } catch (error) {
         console.error('Image Generation Backend Error:', error.message);
-        // Use proper status code for internal/external errors
         res.status(500).json({ error: `Image generation failed: ${error.message}` });
     }
 });
 
 
 app.listen(port, () => {
-    console.log(`Server listening on port ${port}`);
+    console.log(`CortexLuma Backend listening on port ${port}`);
 });
