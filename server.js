@@ -22,8 +22,12 @@ const MAX_HISTORY_LENGTH = 50; // Max turns of history
 const MAX_PROMPT_LENGTH = 15000; // Max characters in the current turn
 
 // Middleware Setup
-// Increase limit for JSON body to allow for large Base64 image strings (up to 50MB)
-app.use(cors());
+// FIX: Explicitly set CORS origin to allow your frontend URL (GitHub Pages) and local testing
+app.use(cors({
+    origin: ['https://oryndel.github.io', 'http://localhost:3000', 'https://oryndel.github.io/cortexluma'],
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type'],
+}));
 app.use(express.json({ limit: '50mb' }));
 
 // -----------------------------------------------------------------
@@ -41,7 +45,7 @@ app.get('/', (req, res) => {
 // STREAMING CHAT ENDPOINT
 // -----------------------------------------------------------------
 app.post('/api/stream-chat', async (req, res) => {
-    // FIX 2 & 3: Destructure all fields from the frontend payload
+    // Destructure all fields from the frontend payload
     const { history, prompt, imageParts, temperature, maxOutputTokens, systemInstruction } = req.body; 
 
     // 1. Fail-Fast Validation
@@ -69,7 +73,7 @@ app.post('/api/stream-chat', async (req, res) => {
         // Add the current user prompt (and optional image(s))
         const userParts = [{ text: prompt }];
         
-        // FIX 3: Handle imageParts array (multi-image support)
+        // Handle imageParts array (multi-image support)
         if (imageParts && Array.isArray(imageParts)) {
             imageParts.forEach(part => {
                 if (part.inlineData) {
@@ -82,7 +86,7 @@ app.post('/api/stream-chat', async (req, res) => {
         // Configuration for fast streaming and grounding
         const model = 'gemini-2.5-flash';
         
-        // FIX 2: Use dynamic settings from the request body
+        // Use dynamic settings from the request body
         const defaultInstruction = "You are CortexLuma, a helpful and concise AI assistant. Answer the user's questions clearly, and provide relevant sources if using Google Search grounding.";
         
         const generationConfig = {
@@ -135,7 +139,7 @@ app.post('/api/stream-chat', async (req, res) => {
 
 
 // -----------------------------------------------------------------
-// IMAGE GENERATION ENDPOINT
+// IMAGE GENERATION ENDPOINT (No changes needed, but included for completeness)
 // -----------------------------------------------------------------
 const IMAGEN_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict";
 
