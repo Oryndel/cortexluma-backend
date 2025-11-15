@@ -1,221 +1,209 @@
 import express from 'express';
 import cors from 'cors';
 import 'dotenv/config'; 
-import fetch from 'node-fetch'; 
 import { GoogleGenAI } from "@google/genai";
+import fetch from 'node-fetch'; // Required for making external API calls like Imagen
 
-// --- Configuration and Initialization ---
-
-// CRITICAL CHECK: Ensure API Key is available
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-if (!GEMINI_API_KEY) {
-    console.error("FATAL ERROR: GEMINI_API_KEY is missing. Please ensure your environment variable is set.");
-    // The server will proceed but API calls will fail immediately.
-}
-
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+// Initialize Gemini Client
+// NOTE: Ensure your .env file has GEMINI_API_KEY="YOUR_KEY"
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Set hard limits for fast response (Fail-Fast Validation)
-const MAX_HISTORY_LENGTH = 50; // Max turns of history
-const MAX_PROMPT_LENGTH = 15000; // Max characters in the current turn
-
-// Middleware Setup
 // Increase limit for JSON body to allow for large Base64 image strings (up to 50MB)
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 // -----------------------------------------------------------------
-// HEALTH CHECK / ROOT ENDPOINT
+// HEALTH CHECK / ROOT ENDPOINT (NEW)
 // -----------------------------------------------------------------
 app.get('/', (req, res) => {
+    // This route responds to the browser/Render health check on the base URL.
     res.status(200).json({
         status: 'OK',
         message: 'CortexLuma AI Backend is running. Use /api/stream-chat or /api/generate-image via POST.',
-        version: '1.0.2'
+        version: '1.0.0'
     });
 });
 
 // -----------------------------------------------------------------
 // STREAMING CHAT ENDPOINT (Analysis: gemini-2.5-flash with Google Search)
-// Optimized for maximum streaming speed and aggressive retry on initial connection.
+// Handles multi-turn chat, multi-image analysis, and configurable settings.
 // -----------------------------------------------------------------
 app.post('/api/stream-chat', async (req, res) => {
-    // 1. Initial validation
-    const { history, prompt, base64Image } = req.body;
+    // Set headers for streaming (Server-Sent Events configuration for plain text chunks)
+    res.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Connection': 'keep-alive',
+        'Cache-Control': 'no-cache',
+        'Transfer-Encoding': 'chunked'
+    });
 
-    if (!prompt) {
-        return res.status(400).json({ error: "Prompt is required." });
-    }
-
-    if (prompt.length > MAX_PROMPT_LENGTH) {
-        return res.status(400).json({ error: `Prompt exceeds maximum length of ${MAX_PROMPT_LENGTH} characters.` });
-    }
-
-    // 2. Construct chat history
-    const chatHistory = history ? [...history].slice(-MAX_HISTORY_LENGTH) : [];
-
-    // Add current user prompt (and image, if provided)
-    const userParts = [{ text: prompt }];
-
-    if (base64Image) {
-        try {
-            // base64Image is expected to be a data URL (e.g., 'data:image/jpeg;base64,...')
-            const [mimeTypePart, base64Data] = base64Image.split(';base64,');
-            const mimeType = mimeTypePart.split(':')[1];
-            
-            if (!mimeType || !base64Data) {
-                throw new Error("Invalid base64 image format.");
-            }
-
-            userParts.push({
-                inlineData: {
-                    mimeType: mimeType,
-                    data: base64Data
-                }
-            });
-        } catch (e) {
-            console.error("Image parsing error:", e.message);
-            return res.status(400).json({ error: "Invalid image data provided." });
-        }
-    }
-
-    chatHistory.push({ role: "user", parts: userParts });
-
-    // 3. Configure response headers for streaming
-    res.setHeader('Content-Type', 'text/plain'); // Sending raw text chunks
-    res.setHeader('Transfer-Encoding', 'chunked');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.status(200);
-
-    const MAX_RETRIES = 3;
-    let retries = 0;
-    let responseStream;
-
-    while (retries < MAX_RETRIES) {
-        try {
-            // 4. Call Gemini API with Exponential Backoff
-            responseStream = await ai.models.generateContentStream({
-                model: "gemini-2.5-flash",
-                contents: chatHistory,
-                config: {
-                    // Enable Google Search grounding tool
-                    tools: [{ googleSearch: {} }],
-                },
-            });
-
-            // If successful, break the retry loop
-            break; 
-
-        } catch (error) {
-            retries++;
-            if (retries >= MAX_RETRIES) {
-                console.error(`FATAL: Gemini API call failed after ${MAX_RETRIES} retries.`, error.message);
-                // Clean up response stream and close connection on fatal error
-                res.end(`[STREAM_ERROR] Gemini API failed: ${error.message}`);
-                return;
-            }
-            // Implement exponential backoff delay
-            const delay = Math.pow(2, retries) * 1000;
-            console.warn(`Gemini API connection failed (Attempt ${retries}/${MAX_RETRIES}). Retrying in ${delay}ms...`);
-            await new Promise(resolve => setTimeout(resolve, delay));
-        }
-    }
-
-    if (!responseStream) {
-        // This case should not happen if the retry loop is correctly structured, but acts as a safeguard.
-        return res.end("[STREAM_ERROR] Could not initialize Gemini stream.");
+    // Destructure new config parameters and multiple images
+    const { 
+        history, 
+        imageParts, 
+        temperature, 
+        maxOutputTokens, 
+        systemInstruction,
+        safetySettings
+    } = req.body;
+    
+    if (!history || history.length === 0) {
+        res.write('Error: Chat history is required.');
+        return res.end();
     }
     
-    // 5. Stream the response chunks to the client
-    try {
-        for await (const chunk of responseStream) {
-            if (chunk.text) {
-                res.write(chunk.text);
-            }
+    // The last part of the history must be the user's current prompt (part of the last turn)
+    const lastUserTurn = history[history.length - 1];
+    
+    if (lastUserTurn.role !== 'user' || !lastUserTurn.parts || lastUserTurn.parts.length === 0) {
+        res.write('Error: Invalid last chat turn format.');
+        return res.end();
+    }
 
-            // Stream citations when available (only included in the final chunk)
-            if (chunk.candidates?.[0]?.groundingMetadata?.groundingAttributions) {
-                const attributions = chunk.candidates[0].groundingMetadata.groundingAttributions;
-                const sources = attributions.map(attr => ({
-                    uri: attr.web?.uri,
-                    title: attr.web?.title,
-                })).filter(source => source.uri && source.title);
+    // Combine history parts and new image parts for the API call
+    const contents = [...history];
 
-                if (sources.length > 0) {
-                    // Send a special JSON marker for the frontend to parse
-                    // The frontend must parse any line starting with [METADATA]
-                    res.write(`\n[METADATA]${JSON.stringify({ sources: sources })}`);
+    // Append image parts to the last user turn if present
+    if (imageParts && imageParts.length > 0) {
+        contents[contents.length - 1].parts = [
+            ...contents[contents.length - 1].parts,
+            ...imageParts
+        ];
+    }
+    
+    let delay = 1000; // Initial delay of 1 second
+    const maxRetries = 3;
+
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            const stream = await ai.models.generateContentStream({
+                model: "gemini-2.5-flash", 
+                contents: contents, 
+                config: {
+                    // FEATURE: Google Search grounding
+                    tools: [{ googleSearch: {} }], 
+                    
+                    // FEATURE: Temperature (Creativity)
+                    temperature: temperature !== undefined ? parseFloat(temperature) : 0.7, 
+                    
+                    // FEATURE: Max Output Tokens
+                    maxOutputTokens: maxOutputTokens !== undefined ? parseInt(maxOutputTokens) : 2048,
+                    
+                    // FEATURE: System Instruction/Personality
+                    systemInstruction: systemInstruction || "You are CortexLuma, a powerful, witty, and highly helpful AI assistant built by Google. You excel at real-time data retrieval and coding tasks. Keep your answers concise, clear, and engaging.",
+                    
+                    // FEATURE: Safety Settings
+                    safetySettings: safetySettings
+                }
+            });
+
+            for await (const chunk of stream) {
+                const text = chunk.text;
+                if (text) {
+                    res.write(text);
                 }
             }
+            break; // Success, break the retry loop
+
+        } catch (error) {
+            console.error(`Attempt ${i + 1}: Gemini API Error:`, error);
+            if (i === maxRetries - 1) {
+                // Send a clearer error back to the client on final failure
+                res.write(`Error: An internal API error occurred after ${maxRetries} attempts. Details: ${error.message}`);
+                break;
+            }
+            // Wait and retry
+            await new Promise(resolve => setTimeout(resolve, delay));
+            delay *= 2; 
         }
-    } catch (error) {
-        console.error("Error during streaming:", error.message);
-        res.end(`\n[STREAM_ERROR] Streaming connection lost: ${error.message}`);
-    } finally {
-        // 6. End the response stream
-        res.end();
     }
+
+    res.end(); 
 });
 
 
 // -----------------------------------------------------------------
-// IMAGE GENERATION ENDPOINT (Imagen 4.0)
-// Uses node-fetch to call the external service
+// IMAGE GENERATION ENDPOINT (Analysis: Imagen 3.0 via HTTP API)
 // -----------------------------------------------------------------
-const IMAGEN_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict";
-
 app.post('/api/generate-image', async (req, res) => {
-    const { prompt } = req.body;
-
-    if (!prompt) {
-        return res.status(400).json({ error: "Prompt is required for image generation." });
+    // This is for the Imagen model which requires an external API call
+    const IMAGEN_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key=${process.env.GEMINI_API_KEY}`;
+    
+    // Note: The GEMINI_API_KEY is used for Imagen 3.0 via the HTTP API.
+    if (!process.env.GEMINI_API_KEY) {
+        return res.status(500).json({ error: 'GEMINI_API_KEY not set in environment variables.' });
     }
 
-    const payload = {
-        instances: {
-            prompt: prompt
-        },
-        parameters: {
+    const { prompt } = req.body;
+    if (!prompt) {
+        return res.status(400).json({ error: 'Prompt is required for image generation.' });
+    }
+
+    // Imagen 3.0 parameters
+    const payload = { 
+        instances: { prompt: prompt }, 
+        parameters: { 
             "sampleCount": 1,
-            "aspectRatio": "1:1" 
+            "outputMimeType": "image/png",
+            "aspectRatio": "1:1" // Default to square
         } 
     };
     
-    // NOTE: This endpoint uses a single, non-retried fetch call for fast feedback.
-    try {
-        const fetchResponse = await fetch(IMAGEN_API_URL, {
-            method: 'POST',
-            // CRITICAL: We pass the API key via a header for Imagen API
-            headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': GEMINI_API_KEY },
-            body: JSON.stringify(payload)
-        });
+    let delay = 1000; // Initial delay of 1 second
+    const maxRetries = 3;
+    let fetchResponse;
 
-        if (!fetchResponse.ok) {
-            const errorBody = await fetchResponse.json();
-            console.error('External Image API Error Response:', errorBody);
-            throw new Error(`External Image API Error (${fetchResponse.status}): ${errorBody.error?.message || 'Unknown error from Imagen API'}`);
+    try {
+        for (let i = 0; i < maxRetries; i++) {
+            try {
+                fetchResponse = await fetch(IMAGEN_API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (fetchResponse.ok) {
+                    break; // Success, exit retry loop
+                }
+
+                // If HTTP status is not 200, throw to trigger backoff/retry
+                if (i === maxRetries - 1) {
+                    const errorBody = await fetchResponse.json();
+                    throw new Error(`External Image API Error (${fetchResponse.status}): ${errorBody.error?.message || 'Unknown error'}`);
+                }
+            } catch (error) {
+                if (i === maxRetries - 1) throw error; // Re-throw if it's the last attempt
+                // Non-HTTP errors (e.g., network issues) also trigger backoff
+                await new Promise(resolve => setTimeout(resolve, delay));
+                delay *= 2; 
+            }
         }
         
         const result = await fetchResponse.json();
+        
+        // Extract the base64 data as per instruction
         const base64Data = result?.predictions?.[0]?.bytesBase64Encoded;
 
         if (base64Data) {
+            // Respond with the base64 data wrapped in a data URL as JSON
             const imageUrl = `data:image/png;base64,${base64Data}`;
             res.json({ imageUrl: imageUrl });
         } else {
+            // Log full API response if data is missing for debugging
             console.error('Image generation response missing data:', result);
             res.status(500).json({ error: 'Image generation failed: No image data received.' });
         }
 
     } catch (error) {
         console.error('Image Generation Backend Error:', error.message);
+        // Ensure the response is always JSON for the frontend to handle
         res.status(500).json({ error: `Image generation failed: ${error.message}` });
     }
 });
 
 
 app.listen(port, () => {
-    console.log(`Server listening on port ${port} (http://localhost:${port})`);
+    console.log(`Server listening on port ${port}`);
 });
